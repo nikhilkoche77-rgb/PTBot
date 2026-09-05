@@ -1,1 +1,4 @@
-requirements.txt
+requests
+pandas
+numpy
+yfinance
