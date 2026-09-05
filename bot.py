@@ -8,14 +8,20 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# Environment Variables
+# --- TELEGRAM CONFIG ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-MY_CHAT_ID = os.getenv("MY_CHAT_ID", "")
+
+# Teeno users ki Chat IDs yahan list me set karo
+ALLOWED_CHAT_IDS = [
+    "1345385952",              # Aapki Chat ID (Admin)
+    "849346521",     # Second person ki Chat ID daalo
+    "8548337411"      # Third person ki Chat ID daalo
+]
 
 # --- RISK & ALLOCATION CONFIG ---
 RISK_CONFIG = {
     "trade_allocation_pct": 0.05,     # Har trade me amount ka exactly 5% lagega
-    "max_open_trades": 5,             # Max 5 simultaneous trades allowed
+    "max_open_trades": 5,             # Max 5 open trades allowed
     "daily_drawdown_limit_pct": 0.06  # Din ka max 6% loss circuit breaker
 }
 
@@ -89,7 +95,7 @@ def check_daily_drawdown_circuit_breaker():
         PAPER_ACCOUNT["trading_halted_today"] = True
         send_telegram(
             f"🚨 *RISK CIRCUIT BREAKER TRIGGERED*\n\n"
-            f"Daily loss exceeded limit (${daily_loss:,.2f}). Trading halted for today."
+            f"Daily loss exceeded 6% limit (${daily_loss:,.2f}). Trading halted for today."
         )
 
 def get_top_crypto_symbols(limit=50):
@@ -137,15 +143,20 @@ def get_top_crypto_symbols(limit=50):
                         "trade_val": 0.0, "tp1_hit": False
                     }
 
-def send_telegram(message, chat_id=MY_CHAT_ID):
-    if not TELEGRAM_TOKEN or not chat_id:
+def send_telegram(message, chat_id=None):
+    """chat_id specify kiya toh usko jayega, warna sabhi allowed users ko alert jayega"""
+    if not TELEGRAM_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+    target_ids = [chat_id] if chat_id else ALLOWED_CHAT_IDS
+
+    for uid in target_ids:
+        if uid and not uid.startswith("USER_"):
+            payload = {"chat_id": uid, "text": message, "parse_mode": "Markdown"}
+            try:
+                requests.post(url, json=payload, timeout=10)
+            except Exception as e:
+                print(f"Telegram error for {uid}: {e}")
 
 def handle_incoming_users():
     last_update_id = 0
@@ -165,13 +176,14 @@ def handle_incoming_users():
                         sender_id = str(update["message"]["chat"]["id"])
                         user_name = update["message"]["from"].get("first_name", "Trader")
 
-                        if sender_id == str(MY_CHAT_ID):
+                        # Teeno allowed users me se koi bhi message kare
+                        if sender_id in ALLOWED_CHAT_IDS:
                             active_count = get_open_positions_count()
                             total_equity = get_total_equity()
-                            status_txt = "🔴 Halted" if PAPER_ACCOUNT["trading_halted_today"] else "🟢 Active"
+                            status_txt = "🔴 Circuit Halted" if PAPER_ACCOUNT["trading_halted_today"] else "🟢 Active"
                             send_telegram(
                                 f"💼 *Dashboard (5% Allocation Rule)*\n\n"
-                                f"👤 Trader: {user_name}\n"
+                                f"👤 User: {user_name}\n"
                                 f"💰 *Available Cash:* ${PAPER_ACCOUNT['cash']:,.2f}\n"
                                 f"📊 *Total Portfolio:* ${total_equity:,.2f}\n"
                                 f"📈 *Realized P&L:* ${PAPER_ACCOUNT['realized_pnl']:+,.2f}\n"
@@ -254,7 +266,7 @@ def execute_exit(strat_key, strat_label, name, exit_price, reason, partial=False
             f"🪙 Asset: {name}\n"
             f"💵 Exit: ${exit_price:.4f}\n"
             f"💰 *Partial P&L:* *${pnl:+,.2f} ({pnl_pct:+.2f}%)*\n"
-            f"🛡️ *SL shifted to Breakeven (Entry):* ${pos['entry']:.4f}\n"
+            f"🛡️ *SL shifted to Breakeven:* ${pos['entry']:.4f}\n"
             f"Remaining 50% running risk-free for TP3 (1:5)! 🚀"
         )
     else:
@@ -284,18 +296,15 @@ def manage_trailing_sl_and_tps(strat_key, strat_label, name, curr_price):
     trailing_gap = pos["atr"] * 1.5
 
     if pos["side"] == "BUY":
-        # TP1 (1:2) Partial Exit
         if (not pos["tp1_hit"]) and len(pos["tp"]) > 0 and (curr_price >= pos["tp"][0]):
             pos["tp1_hit"] = True
             pos["sl"] = max(pos["sl"], pos["entry"])
             execute_exit(strat_key, strat_label, name, curr_price, "TP1 Hit", partial=True)
 
-        # TP3 (1:5) Final Exit
         elif len(pos["tp"]) >= 3 and curr_price >= pos["tp"][2]:
             execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5) Hit! 🏆")
             return
 
-        # Trailing SL
         if curr_price > pos["best_price"]:
             pos["best_price"] = curr_price
             new_sl = curr_price - trailing_gap
@@ -305,18 +314,15 @@ def manage_trailing_sl_and_tps(strat_key, strat_label, name, curr_price):
             execute_exit(strat_key, strat_label, name, curr_price, "Stop Loss Triggered")
 
     elif pos["side"] == "SELL":
-        # TP1 (1:2) Partial Exit
         if (not pos["tp1_hit"]) and len(pos["tp"]) > 0 and (curr_price <= pos["tp"][0]):
             pos["tp1_hit"] = True
             pos["sl"] = min(pos["sl"], pos["entry"])
             execute_exit(strat_key, strat_label, name, curr_price, "TP1 Hit", partial=True)
 
-        # TP3 (1:5) Final Exit
         elif len(pos["tp"]) >= 3 and curr_price <= pos["tp"][2]:
             execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5) Hit! 🏆")
             return
 
-        # Trailing SL
         if curr_price < pos["best_price"]:
             pos["best_price"] = curr_price
             new_sl = curr_price + trailing_gap
@@ -380,7 +386,6 @@ def check_strategy_for_symbol(strat_key, cfg, name, ticker_symbol):
             risk_per_unit = curr_price - sl
 
             if risk_per_unit > 0:
-                # Direct 5% Cash Allocation
                 trade_cost = PAPER_ACCOUNT["cash"] * RISK_CONFIG["trade_allocation_pct"]
 
                 if trade_cost > 10 and trade_cost <= PAPER_ACCOUNT["cash"]:
@@ -449,7 +454,7 @@ class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"5% Allocation Paper Trading Engine Live")
+        self.wfile.write(b"Multi-User Paper Trading Engine Active")
 
 def run_server():
     port = int(os.getenv("PORT", 8080))
@@ -463,12 +468,11 @@ if __name__ == "__main__":
     threading.Thread(target=handle_incoming_users, daemon=True).start()
 
     send_telegram(
-        f"🛡️ *Engine Live: 5% Fixed Allocation Rule*\n\n"
-        f"• Trade Sizing: Exactly 5% of Available Cash per Trade\n"
-        f"• Starting Balance: $10,000 USD\n"
-        f"• R:R Targets: 1:2 (50% Book) -> 1:5 (Runner)\n"
-        f"• Max Open Positions: 5\n"
-        f"• Scanning Top {len(SYMBOLS)} Cryptos."
+        f"👥 *Multi-User Paper Trading Engine Live!*\n\n"
+        f"• Authorized Users: {len(ALLOWED_CHAT_IDS)}\n"
+        f"• Trade Sizing: 5% of Cash per Trade\n"
+        f"• Targets: 1:2 (50% Exit) -> 1:5 (Runner)\n"
+        f"• Scanning Top {len(SYMBOLS)} Cryptos 24/7."
     )
 
     last_list_refresh = time.time()
