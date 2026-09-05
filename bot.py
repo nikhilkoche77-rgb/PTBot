@@ -8,8 +8,19 @@ import requests
 import yfinance as yf
 
 # Environment Variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MY_CHAT_ID = os.getenv("MY_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+MY_CHAT_ID = os.getenv("MY_CHAT_ID", "")
+
+# --- PAPER TRADING ACCOUNT ---
+PAPER_ACCOUNT = {
+    "starting_balance": 10000.0,
+    "cash": 10000.0,
+    "realized_pnl": 0.0,
+    "risk_per_trade_pct": 0.02  # 2% Risk per trade
+}
+
+# Fixed R:R Targets [TP1 = 1:2, TP2 = 1:2, TP3 = 1:5]
+TARGET_RR_MULTIPLIERS = [2.0, 2.0, 5.0]
 
 STRATEGIES = {
     "SCALP": {
@@ -18,7 +29,7 @@ STRATEGIES = {
         "mtf_interval": "5m", "mtf_period": "5d",
         "entry_interval": "1m", "entry_period": "1d",
         "adx_min": 23,
-        "tp_multipliers": [1.5, 2.0, 3.0, 5.0]
+        "tp_multipliers": TARGET_RR_MULTIPLIERS
     },
     "INTRADAY": {
         "label": "⏱️ [INTRADAY - 1D/4H/1H to 5M/15M]",
@@ -26,7 +37,7 @@ STRATEGIES = {
         "mtf_interval": "1h", "mtf_period": "30d",
         "entry_interval": "5m", "entry_period": "5d",
         "adx_min": 22,
-        "tp_multipliers": [1.5, 2.5, 3.5, 5.0]
+        "tp_multipliers": TARGET_RR_MULTIPLIERS
     },
     "SWING": {
         "label": "🌊 [SWING - 1W/1D to 1H]",
@@ -34,19 +45,15 @@ STRATEGIES = {
         "mtf_interval": "1d", "mtf_period": "1y",
         "entry_interval": "1h", "entry_period": "1mo",
         "adx_min": 20,
-        "tp_multipliers": [2.0, 3.0, 4.5, 6.0]
+        "tp_multipliers": TARGET_RR_MULTIPLIERS
     }
 }
 
-# Dynamic Symbol Store & Position Tracker
 SYMBOLS = {}
 active_positions = {strat: {} for strat in STRATEGIES}
-
-# Stablecoins jinhe trade nahi karna hai
 EXCLUDED_STABLES = {"USDT", "USDC", "DAI", "BUSD", "FDUSD", "TUSD", "USDD", "PYUSD"}
 
 def get_top_crypto_symbols(limit=50):
-    """CoinGecko API se top market-cap coins dynamically fetch karta hai"""
     global SYMBOLS, active_positions
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -73,18 +80,23 @@ def get_top_crypto_symbols(limit=50):
                 for name in SYMBOLS:
                     if name not in active_positions[strat]:
                         active_positions[strat][name] = {
-                            "side": None, "entry": 0.0, "sl": 0.0, "best_price": 0.0, "atr": 0.0
+                            "side": None, "entry": 0.0, "sl": 0.0, "tp": [],
+                            "best_price": 0.0, "atr": 0.0, "units": 0.0, 
+                            "trade_val": 0.0, "tp1_hit": False
                         }
             print(f"✅ Loaded {len(SYMBOLS)} Top Cryptos successfully.")
     except Exception as e:
-        print(f"CoinGecko Fetch Error: {e}")
-        # Fallback default list agar API block ya slow ho
+        print(f"CoinGecko Error: {e}")
         if not SYMBOLS:
             default_list = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "LINK", "SUI", "NEAR", "DOT"]
             SYMBOLS = {f"{s}/USD": f"{s}-USD" for s in default_list}
             for strat in STRATEGIES:
                 for name in SYMBOLS:
-                    active_positions[strat][name] = {"side": None, "entry": 0.0, "sl": 0.0, "best_price": 0.0, "atr": 0.0}
+                    active_positions[strat][name] = {
+                        "side": None, "entry": 0.0, "sl": 0.0, "tp": [],
+                        "best_price": 0.0, "atr": 0.0, "units": 0.0, 
+                        "trade_val": 0.0, "tp1_hit": False
+                    }
 
 def send_telegram(message, chat_id=MY_CHAT_ID):
     if not TELEGRAM_TOKEN or not chat_id:
@@ -115,23 +127,21 @@ def handle_incoming_users():
                         user_name = update["message"]["from"].get("first_name", "Trader")
 
                         if sender_id == str(MY_CHAT_ID):
+                            active_count = sum(
+                                1 for s in active_positions.values() for p in s.values() if p["side"] is not None
+                            )
                             send_telegram(
-                                f"👑 Admin Dashboard ({user_name})\n\n"
-                                f"🤖 Engine Status: Online 24/7\n"
-                                f"🎯 Scalp: 15m/5m/1m\n"
-                                f"⏱️ Intraday: 1d/4h/1h -> 5m/15m\n"
-                                f"🌊 Swing: 1w/1d -> 1h\n"
-                                f"📊 Active Monitored Coins: {len(SYMBOLS)} Cryptos",
+                                f"💼 *Demo Paper Trading Dashboard*\n\n"
+                                f"👤 Trader: {user_name}\n"
+                                f"💰 *Available Cash:* ${PAPER_ACCOUNT['cash']:,.2f}\n"
+                                f"📈 *Realized P&L:* ${PAPER_ACCOUNT['realized_pnl']:+,.2f}\n"
+                                f"📊 *Open Paper Positions:* {active_count}\n"
+                                f"🎯 *R:R Setting:* TP1 (1:2) | TP2 (1:2) | TP3 (1:5)\n\n"
+                                f"🤖 *Status:* Live 24/7 Scanning Top {len(SYMBOLS)} Coins",
                                 chat_id=sender_id
                             )
                         else:
-                            public_notice = (
-                                f"Hello {user_name}! 👋\n\n"
-                                f"⚠️ Private Algorithmic Engine\n"
-                                f"Signals are restricted to authorized administrators.\n\n"
-                                f"🔒 Access: Closed"
-                            )
-                            send_telegram(public_notice, chat_id=sender_id)
+                            send_telegram("🔒 Access Restricted.", chat_id=sender_id)
         except Exception as e:
             print(f"Listener issue: {e}")
         time.sleep(2)
@@ -183,7 +193,37 @@ def get_trend(ticker_symbol, period, interval):
     except Exception:
         return "NEUTRAL"
 
-def manage_trailing_sl(strat_key, strat_label, name, curr_price):
+def execute_exit(strat_key, strat_label, name, exit_price, reason):
+    pos = active_positions[strat_key][name]
+    if pos["side"] == "BUY":
+        pnl = (exit_price - pos["entry"]) * pos["units"]
+    else:
+        pnl = (pos["entry"] - exit_price) * pos["units"]
+
+    PAPER_ACCOUNT["cash"] += (pos["trade_val"] + pnl)
+    PAPER_ACCOUNT["realized_pnl"] += pnl
+    pnl_pct = (pnl / pos["trade_val"]) * 100 if pos["trade_val"] > 0 else 0.0
+
+    icon = "🟢 PROFIT HIT" if pnl >= 0 else "🔴 STOP LOSS HIT"
+
+    msg = (
+        f"{icon} (PAPER TRADE CLOSED)\n\n"
+        f"🏷️ *Strategy:* {strat_label}\n"
+        f"🪙 *Asset:* {name} ({pos['side']})\n"
+        f"💵 *Entry:* ${pos['entry']:.4f} | *Exit:* ${exit_price:.4f}\n"
+        f"📦 *Invested:* ${pos['trade_val']:,.2f}\n"
+        f"📊 *Net P&L:* *${pnl:+,.2f} ({pnl_pct:+.2f}%)*\n"
+        f"🛑 *Reason:* {reason}\n\n"
+        f"💼 *New Demo Balance:* *${PAPER_ACCOUNT['cash']:,.2f}*"
+    )
+    send_telegram(msg)
+    active_positions[strat_key][name] = {
+        "side": None, "entry": 0.0, "sl": 0.0, "tp": [],
+        "best_price": 0.0, "atr": 0.0, "units": 0.0, 
+        "trade_val": 0.0, "tp1_hit": False
+    }
+
+def manage_trailing_sl_and_tps(strat_key, strat_label, name, curr_price):
     if name not in active_positions[strat_key]:
         return
     pos = active_positions[strat_key][name]
@@ -193,50 +233,64 @@ def manage_trailing_sl(strat_key, strat_label, name, curr_price):
     trailing_gap = pos["atr"] * 1.5
 
     if pos["side"] == "BUY":
+        # Target 1 (1:2) Hit -> Move SL to Breakeven
+        if (not pos["tp1_hit"]) and len(pos["tp"]) > 0 and (curr_price >= pos["tp"][0]):
+            pos["tp1_hit"] = True
+            pos["sl"] = max(pos["sl"], pos["entry"])
+            send_telegram(
+                f"🎯 *TARGET 1 (1:2) HIT (BUY)*\n"
+                f"🪙 Asset: {name}\n"
+                f"💵 Price: ${curr_price:.4f}\n"
+                f"🛡️ *SL moved to Breakeven (Entry):* ${pos['entry']:.4f}\n"
+                f"Trade is now Risk-Free! 🚀"
+            )
+
+        # Final Target 3 (1:5) Hit Exit
+        if len(pos["tp"]) >= 3 and curr_price >= pos["tp"][2]:
+            execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5 Ratio) Achieved! 🏆")
+            return
+
+        # Trailing SL update
         if curr_price > pos["best_price"]:
             pos["best_price"] = curr_price
             new_sl = curr_price - trailing_gap
             if new_sl > pos["sl"]:
                 pos["sl"] = new_sl
-                send_telegram(
-                    f"🛡️ TRAILING SL UPDATED (BUY)\n"
-                    f"🏷️ Strategy: {strat_label}\n"
-                    f"🪙 Asset: {name}\n"
-                    f"📈 High: {pos['best_price']:.4f}\n"
-                    f"🛑 New SL: {pos['sl']:.4f}"
-                )
+
+        # Stop Loss Triggered
         elif curr_price <= pos["sl"]:
-            send_telegram(
-                f"🔴 EXIT HIT (STOP LOSS)\n"
-                f"🏷️ Strategy: {strat_label}\n"
-                f"🪙 Asset: {name}\n"
-                f"💵 Exit: {curr_price:.4f}\n"
-                f"🛑 SL Level: {pos['sl']:.4f}"
-            )
-            pos["side"] = None
+            reason = "Trailing SL / Stop Loss Triggered"
+            execute_exit(strat_key, strat_label, name, curr_price, reason)
 
     elif pos["side"] == "SELL":
+        # Target 1 (1:2) Hit -> Move SL to Breakeven
+        if (not pos["tp1_hit"]) and len(pos["tp"]) > 0 and (curr_price <= pos["tp"][0]):
+            pos["tp1_hit"] = True
+            pos["sl"] = min(pos["sl"], pos["entry"])
+            send_telegram(
+                f"🎯 *TARGET 1 (1:2) HIT (SELL)*\n"
+                f"🪙 Asset: {name}\n"
+                f"💵 Price: ${curr_price:.4f}\n"
+                f"🛡️ *SL moved to Breakeven (Entry):* ${pos['entry']:.4f}\n"
+                f"Trade is now Risk-Free! 🚀"
+            )
+
+        # Final Target 3 (1:5) Hit Exit
+        if len(pos["tp"]) >= 3 and curr_price <= pos["tp"][2]:
+            execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5 Ratio) Achieved! 🏆")
+            return
+
+        # Trailing SL update
         if curr_price < pos["best_price"]:
             pos["best_price"] = curr_price
             new_sl = curr_price + trailing_gap
             if new_sl < pos["sl"]:
                 pos["sl"] = new_sl
-                send_telegram(
-                    f"🛡️ TRAILING SL UPDATED (SELL)\n"
-                    f"🏷️ Strategy: {strat_label}\n"
-                    f"🪙 Asset: {name}\n"
-                    f"📉 Low: {pos['best_price']:.4f}\n"
-                    f"🛑 New SL: {pos['sl']:.4f}"
-                )
+
+        # Stop Loss Triggered
         elif curr_price >= pos["sl"]:
-            send_telegram(
-                f"🔴 EXIT HIT (STOP LOSS)\n"
-                f"🏷️ Strategy: {strat_label}\n"
-                f"🪙 Asset: {name}\n"
-                f"💵 Exit: {curr_price:.4f}\n"
-                f"🛑 SL Level: {pos['sl']:.4f}"
-            )
-            pos["side"] = None
+            reason = "Trailing SL / Stop Loss Triggered"
+            execute_exit(strat_key, strat_label, name, curr_price, reason)
 
 def check_strategy_for_symbol(strat_key, cfg, name, ticker_symbol):
     try:
@@ -273,59 +327,87 @@ def check_strategy_for_symbol(strat_key, cfg, name, ticker_symbol):
         swing_h = float(df['swing_high'].iloc[-1])
         swing_l = float(df['swing_low'].iloc[-1])
 
-        manage_trailing_sl(strat_key, cfg["label"], name, curr_price)
+        manage_trailing_sl_and_tps(strat_key, cfg["label"], name, curr_price)
 
         strong_trend = curr_adx > cfg["adx_min"]
         active_pos = active_positions[strat_key][name]["side"]
         tp_mults = cfg["tp_multipliers"]
 
+        # BUY SETUP
         if (active_pos is None) and (htf_trend == "BULLISH") and strong_trend and (df['ema50'].iloc[-1] > df['ema93'].iloc[-1]) and (curr_price > swing_h) and (curr_price > curr_open):
             atr_sl = curr_price - (curr_atr * 1.5)
             sl = max(swing_l, atr_sl)
-            risk = curr_price - sl
+            risk_per_unit = curr_price - sl
 
-            if risk > 0:
+            if risk_per_unit > 0 and PAPER_ACCOUNT["cash"] >= 200:
+                risk_amount = PAPER_ACCOUNT["cash"] * PAPER_ACCOUNT["risk_per_trade_pct"]
+                units = risk_amount / risk_per_unit
+                total_cost = units * curr_price
+
+                if total_cost > PAPER_ACCOUNT["cash"] * 0.2:
+                    total_cost = PAPER_ACCOUNT["cash"] * 0.2
+                    units = total_cost / curr_price
+
+                PAPER_ACCOUNT["cash"] -= total_cost
+                tp_targets = [curr_price + (risk_per_unit * m) for m in tp_mults]
+
                 active_positions[strat_key][name] = {
-                    "side": "BUY", "entry": curr_price, "sl": sl, "best_price": curr_price, "atr": curr_atr
+                    "side": "BUY", "entry": curr_price, "sl": sl, "tp": tp_targets,
+                    "best_price": curr_price, "atr": curr_atr, "units": units,
+                    "trade_val": total_cost, "tp1_hit": False
                 }
+
                 msg = (
-                    f"🚀 {cfg['label']} BUY SIGNAL\n\n"
-                    f"🪙 Asset: {name}\n"
-                    f"📈 Confluence: {cfg['htf_interval']} + {cfg['mtf_interval']} Bullish\n"
-                    f"💵 Entry: {curr_price:.4f}\n"
-                    f"🛑 SL: {sl:.4f}\n"
-                    f"📊 ATR: {curr_atr:.4f}\n\n"
-                    f"🎯 TARGETS:\n"
-                    f"• TP 1: {curr_price + (risk * tp_mults[0]):.4f}\n"
-                    f"• TP 2: {curr_price + (risk * tp_mults[1]):.4f}\n"
-                    f"• TP 3: {curr_price + (risk * tp_mults[2]):.4f}\n"
-                    f"• TP 4: {curr_price + (risk * tp_mults[3]):.4f}\n\n"
-                    f"⚡ ADX: {curr_adx:.1f}"
+                    f"🚀 *AUTOMATIC BUY TRIGGERED (PAPER)*\n\n"
+                    f"🏷️ *Strategy:* {cfg['label']}\n"
+                    f"🪙 *Asset:* {name}\n"
+                    f"💵 *Entry:* ${curr_price:.4f}\n"
+                    f"📦 *Position:* ${total_cost:,.2f} ({units:.4f} units)\n"
+                    f"🛑 *SL:* ${sl:.4f} (Risk: ${risk_per_unit:.4f})\n\n"
+                    f"🎯 *TARGETS (R:R Ratio):*\n"
+                    f"• TP 1 (1:2): ${tp_targets[0]:.4f}\n"
+                    f"• TP 2 (1:2): ${tp_targets[1]:.4f}\n"
+                    f"• TP 3 (1:5): ${tp_targets[2]:.4f}\n\n"
+                    f"💼 *Remaining Cash:* ${PAPER_ACCOUNT['cash']:,.2f}"
                 )
                 send_telegram(msg)
 
+        # SELL SETUP
         elif (active_pos is None) and (htf_trend == "BEARISH") and strong_trend and (df['ema50'].iloc[-1] < df['ema93'].iloc[-1]) and (curr_price < swing_l) and (curr_price < curr_open):
             atr_sl = curr_price + (curr_atr * 1.5)
             sl = min(swing_h, atr_sl)
-            risk = sl - curr_price
+            risk_per_unit = sl - curr_price
 
-            if risk > 0:
+            if risk_per_unit > 0 and PAPER_ACCOUNT["cash"] >= 200:
+                risk_amount = PAPER_ACCOUNT["cash"] * PAPER_ACCOUNT["risk_per_trade_pct"]
+                units = risk_amount / risk_per_unit
+                total_cost = units * curr_price
+
+                if total_cost > PAPER_ACCOUNT["cash"] * 0.2:
+                    total_cost = PAPER_ACCOUNT["cash"] * 0.2
+                    units = total_cost / curr_price
+
+                PAPER_ACCOUNT["cash"] -= total_cost
+                tp_targets = [curr_price - (risk_per_unit * m) for m in tp_mults]
+
                 active_positions[strat_key][name] = {
-                    "side": "SELL", "entry": curr_price, "sl": sl, "best_price": curr_price, "atr": curr_atr
+                    "side": "SELL", "entry": curr_price, "sl": sl, "tp": tp_targets,
+                    "best_price": curr_price, "atr": curr_atr, "units": units,
+                    "trade_val": total_cost, "tp1_hit": False
                 }
+
                 msg = (
-                    f"⚠️ {cfg['label']} SELL SIGNAL\n\n"
-                    f"🪙 Asset: {name}\n"
-                    f"📉 Confluence: {cfg['htf_interval']} + {cfg['mtf_interval']} Bearish\n"
-                    f"💵 Entry: {curr_price:.4f}\n"
-                    f"🛑 SL: {sl:.4f}\n"
-                    f"📊 ATR: {curr_atr:.4f}\n\n"
-                    f"🎯 TARGETS:\n"
-                    f"• TP 1: {curr_price - (risk * tp_mults[0]):.4f}\n"
-                    f"• TP 2: {curr_price - (risk * tp_mults[1]):.4f}\n"
-                    f"• TP 3: {curr_price - (risk * tp_mults[2]):.4f}\n"
-                    f"• TP 4: {curr_price - (risk * tp_mults[3]):.4f}\n\n"
-                    f"⚡ ADX: {curr_adx:.1f}"
+                    f"⚠️ *AUTOMATIC SHORT/SELL TRIGGERED (PAPER)*\n\n"
+                    f"🏷️ *Strategy:* {cfg['label']}\n"
+                    f"🪙 *Asset:* {name}\n"
+                    f"💵 *Entry:* ${curr_price:.4f}\n"
+                    f"📦 *Position:* ${total_cost:,.2f} ({units:.4f} units)\n"
+                    f"🛑 *SL:* ${sl:.4f} (Risk: ${risk_per_unit:.4f})\n\n"
+                    f"🎯 *TARGETS (R:R Ratio):*\n"
+                    f"• TP 1 (1:2): ${tp_targets[0]:.4f}\n"
+                    f"• TP 2 (1:2): ${tp_targets[1]:.4f}\n"
+                    f"• TP 3 (1:5): ${tp_targets[2]:.4f}\n\n"
+                    f"💼 *Remaining Cash:* ${PAPER_ACCOUNT['cash']:,.2f}"
                 )
                 send_telegram(msg)
 
@@ -336,7 +418,7 @@ class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Crypto Engine Active - Scanning All Coins")
+        self.wfile.write(b"Paper Trading Crypto Engine Live")
 
 def run_server():
     port = int(os.getenv("PORT", 8080))
@@ -344,18 +426,22 @@ def run_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Top 50 Cryptos initial fetch
     get_top_crypto_symbols(limit=50)
 
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=handle_incoming_users, daemon=True).start()
 
-    send_telegram(f"🔥 Multi-Timeframe Crypto Engine Live!\nMonitoring Top {len(SYMBOLS)} Cryptos 24/7.")
+    send_telegram(
+        f"🔥 *Paper Trading Engine Updated!*\n\n"
+        f"• Demo Cash: $10,000 USD\n"
+        f"• R:R Targets: *1:2 | 1:2 | 1:5*\n"
+        f"• Break-even lock on TP1\n"
+        f"• Scanning Top {len(SYMBOLS)} Cryptos 24/7."
+    )
 
     last_list_refresh = time.time()
 
     while True:
-        # Har 6 ghante me coin list refresh hogi (taaki naye pump hone wale coins include ho sakein)
         if time.time() - last_list_refresh > 21600:
             get_top_crypto_symbols(limit=50)
             last_list_refresh = time.time()
@@ -363,5 +449,5 @@ if __name__ == "__main__":
         for name, ticker in list(SYMBOLS.items()):
             for strat_key, cfg in STRATEGIES.items():
                 check_strategy_for_symbol(strat_key, cfg, name, ticker)
-                time.sleep(1.2)  # Rate-limit safety
+                time.sleep(1.2)
         time.sleep(5)
