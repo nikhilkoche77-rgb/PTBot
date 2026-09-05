@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np
 import pandas as pd
@@ -11,15 +12,24 @@ import yfinance as yf
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 MY_CHAT_ID = os.getenv("MY_CHAT_ID", "")
 
+# --- RISK & ALLOCATION CONFIG ---
+RISK_CONFIG = {
+    "trade_allocation_pct": 0.05,     # Har trade me amount ka exactly 5% lagega
+    "max_open_trades": 5,             # Max 5 simultaneous trades allowed
+    "daily_drawdown_limit_pct": 0.06  # Din ka max 6% loss circuit breaker
+}
+
 # --- PAPER TRADING ACCOUNT ---
 PAPER_ACCOUNT = {
     "starting_balance": 10000.0,
     "cash": 10000.0,
     "realized_pnl": 0.0,
-    "risk_per_trade_pct": 0.02  # 2% Risk per trade
+    "daily_starting_balance": 10000.0,
+    "current_day": datetime.utcnow().day,
+    "trading_halted_today": False
 }
 
-# Fixed R:R Targets [TP1 = 1:2, TP2 = 1:2, TP3 = 1:5]
+# Targets R:R Ratio: [TP1 = 1:2, TP2 = 1:2, TP3 = 1:5]
 TARGET_RR_MULTIPLIERS = [2.0, 2.0, 5.0]
 
 STRATEGIES = {
@@ -53,6 +63,35 @@ SYMBOLS = {}
 active_positions = {strat: {} for strat in STRATEGIES}
 EXCLUDED_STABLES = {"USDT", "USDC", "DAI", "BUSD", "FDUSD", "TUSD", "USDD", "PYUSD"}
 
+def get_total_equity():
+    invested = sum(
+        p["trade_val"] for s in active_positions.values() for p in s.values() if p["side"] is not None
+    )
+    return PAPER_ACCOUNT["cash"] + invested
+
+def get_open_positions_count():
+    return sum(1 for s in active_positions.values() for p in s.values() if p["side"] is not None)
+
+def check_daily_drawdown_circuit_breaker():
+    global PAPER_ACCOUNT
+    today = datetime.utcnow().day
+
+    if today != PAPER_ACCOUNT["current_day"]:
+        PAPER_ACCOUNT["current_day"] = today
+        PAPER_ACCOUNT["daily_starting_balance"] = get_total_equity()
+        PAPER_ACCOUNT["trading_halted_today"] = False
+
+    current_equity = get_total_equity()
+    daily_loss = PAPER_ACCOUNT["daily_starting_balance"] - current_equity
+    max_allowed_loss = PAPER_ACCOUNT["daily_starting_balance"] * RISK_CONFIG["daily_drawdown_limit_pct"]
+
+    if daily_loss >= max_allowed_loss and not PAPER_ACCOUNT["trading_halted_today"]:
+        PAPER_ACCOUNT["trading_halted_today"] = True
+        send_telegram(
+            f"🚨 *RISK CIRCUIT BREAKER TRIGGERED*\n\n"
+            f"Daily loss exceeded limit (${daily_loss:,.2f}). Trading halted for today."
+        )
+
 def get_top_crypto_symbols(limit=50):
     global SYMBOLS, active_positions
     try:
@@ -84,7 +123,7 @@ def get_top_crypto_symbols(limit=50):
                             "best_price": 0.0, "atr": 0.0, "units": 0.0, 
                             "trade_val": 0.0, "tp1_hit": False
                         }
-            print(f"✅ Loaded {len(SYMBOLS)} Top Cryptos successfully.")
+            print(f"✅ Loaded {len(SYMBOLS)} Top Cryptos.")
     except Exception as e:
         print(f"CoinGecko Error: {e}")
         if not SYMBOLS:
@@ -127,17 +166,17 @@ def handle_incoming_users():
                         user_name = update["message"]["from"].get("first_name", "Trader")
 
                         if sender_id == str(MY_CHAT_ID):
-                            active_count = sum(
-                                1 for s in active_positions.values() for p in s.values() if p["side"] is not None
-                            )
+                            active_count = get_open_positions_count()
+                            total_equity = get_total_equity()
+                            status_txt = "🔴 Halted" if PAPER_ACCOUNT["trading_halted_today"] else "🟢 Active"
                             send_telegram(
-                                f"💼 *Demo Paper Trading Dashboard*\n\n"
+                                f"💼 *Dashboard (5% Allocation Rule)*\n\n"
                                 f"👤 Trader: {user_name}\n"
                                 f"💰 *Available Cash:* ${PAPER_ACCOUNT['cash']:,.2f}\n"
+                                f"📊 *Total Portfolio:* ${total_equity:,.2f}\n"
                                 f"📈 *Realized P&L:* ${PAPER_ACCOUNT['realized_pnl']:+,.2f}\n"
-                                f"📊 *Open Paper Positions:* {active_count}\n"
-                                f"🎯 *R:R Setting:* TP1 (1:2) | TP2 (1:2) | TP3 (1:5)\n\n"
-                                f"🤖 *Status:* Live 24/7 Scanning Top {len(SYMBOLS)} Coins",
+                                f"📦 *Open Trades:* {active_count}/{RISK_CONFIG['max_open_trades']}\n"
+                                f"⚡ *Status:* {status_txt}",
                                 chat_id=sender_id
                             )
                         else:
@@ -193,35 +232,47 @@ def get_trend(ticker_symbol, period, interval):
     except Exception:
         return "NEUTRAL"
 
-def execute_exit(strat_key, strat_label, name, exit_price, reason):
+def execute_exit(strat_key, strat_label, name, exit_price, reason, partial=False):
     pos = active_positions[strat_key][name]
+    exit_units = pos["units"] * 0.5 if partial else pos["units"]
+    exit_val = pos["trade_val"] * 0.5 if partial else pos["trade_val"]
+
     if pos["side"] == "BUY":
-        pnl = (exit_price - pos["entry"]) * pos["units"]
+        pnl = (exit_price - pos["entry"]) * exit_units
     else:
-        pnl = (pos["entry"] - exit_price) * pos["units"]
+        pnl = (pos["entry"] - exit_price) * exit_units
 
-    PAPER_ACCOUNT["cash"] += (pos["trade_val"] + pnl)
+    PAPER_ACCOUNT["cash"] += (exit_val + pnl)
     PAPER_ACCOUNT["realized_pnl"] += pnl
-    pnl_pct = (pnl / pos["trade_val"]) * 100 if pos["trade_val"] > 0 else 0.0
+    pnl_pct = (pnl / exit_val) * 100 if exit_val > 0 else 0.0
 
-    icon = "🟢 PROFIT HIT" if pnl >= 0 else "🔴 STOP LOSS HIT"
-
-    msg = (
-        f"{icon} (PAPER TRADE CLOSED)\n\n"
-        f"🏷️ *Strategy:* {strat_label}\n"
-        f"🪙 *Asset:* {name} ({pos['side']})\n"
-        f"💵 *Entry:* ${pos['entry']:.4f} | *Exit:* ${exit_price:.4f}\n"
-        f"📦 *Invested:* ${pos['trade_val']:,.2f}\n"
-        f"📊 *Net P&L:* *${pnl:+,.2f} ({pnl_pct:+.2f}%)*\n"
-        f"🛑 *Reason:* {reason}\n\n"
-        f"💼 *New Demo Balance:* *${PAPER_ACCOUNT['cash']:,.2f}*"
-    )
-    send_telegram(msg)
-    active_positions[strat_key][name] = {
-        "side": None, "entry": 0.0, "sl": 0.0, "tp": [],
-        "best_price": 0.0, "atr": 0.0, "units": 0.0, 
-        "trade_val": 0.0, "tp1_hit": False
-    }
+    if partial:
+        pos["units"] -= exit_units
+        pos["trade_val"] -= exit_val
+        send_telegram(
+            f"🎯 *PARTIAL 50% PROFIT SECURED (1:2 R:R)*\n\n"
+            f"🪙 Asset: {name}\n"
+            f"💵 Exit: ${exit_price:.4f}\n"
+            f"💰 *Partial P&L:* *${pnl:+,.2f} ({pnl_pct:+.2f}%)*\n"
+            f"🛡️ *SL shifted to Breakeven (Entry):* ${pos['entry']:.4f}\n"
+            f"Remaining 50% running risk-free for TP3 (1:5)! 🚀"
+        )
+    else:
+        icon = "🟢 PROFIT HIT" if pnl >= 0 else "🔴 STOP LOSS HIT"
+        send_telegram(
+            f"{icon}\n\n"
+            f"🏷️ Strategy: {strat_label}\n"
+            f"🪙 Asset: {name} ({pos['side']})\n"
+            f"💵 Entry: ${pos['entry']:.4f} | Exit: ${exit_price:.4f}\n"
+            f"📊 *Net P&L:* *${pnl:+,.2f} ({pnl_pct:+.2f}%)*\n"
+            f"🛑 Reason: {reason}\n\n"
+            f"💼 *Available Cash:* *${PAPER_ACCOUNT['cash']:,.2f}*"
+        )
+        active_positions[strat_key][name] = {
+            "side": None, "entry": 0.0, "sl": 0.0, "tp": [],
+            "best_price": 0.0, "atr": 0.0, "units": 0.0, 
+            "trade_val": 0.0, "tp1_hit": False
+        }
 
 def manage_trailing_sl_and_tps(strat_key, strat_label, name, curr_price):
     if name not in active_positions[strat_key]:
@@ -233,67 +284,53 @@ def manage_trailing_sl_and_tps(strat_key, strat_label, name, curr_price):
     trailing_gap = pos["atr"] * 1.5
 
     if pos["side"] == "BUY":
-        # Target 1 (1:2) Hit -> Move SL to Breakeven
+        # TP1 (1:2) Partial Exit
         if (not pos["tp1_hit"]) and len(pos["tp"]) > 0 and (curr_price >= pos["tp"][0]):
             pos["tp1_hit"] = True
             pos["sl"] = max(pos["sl"], pos["entry"])
-            send_telegram(
-                f"🎯 *TARGET 1 (1:2) HIT (BUY)*\n"
-                f"🪙 Asset: {name}\n"
-                f"💵 Price: ${curr_price:.4f}\n"
-                f"🛡️ *SL moved to Breakeven (Entry):* ${pos['entry']:.4f}\n"
-                f"Trade is now Risk-Free! 🚀"
-            )
+            execute_exit(strat_key, strat_label, name, curr_price, "TP1 Hit", partial=True)
 
-        # Final Target 3 (1:5) Hit Exit
-        if len(pos["tp"]) >= 3 and curr_price >= pos["tp"][2]:
-            execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5 Ratio) Achieved! 🏆")
+        # TP3 (1:5) Final Exit
+        elif len(pos["tp"]) >= 3 and curr_price >= pos["tp"][2]:
+            execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5) Hit! 🏆")
             return
 
-        # Trailing SL update
+        # Trailing SL
         if curr_price > pos["best_price"]:
             pos["best_price"] = curr_price
             new_sl = curr_price - trailing_gap
             if new_sl > pos["sl"]:
                 pos["sl"] = new_sl
-
-        # Stop Loss Triggered
         elif curr_price <= pos["sl"]:
-            reason = "Trailing SL / Stop Loss Triggered"
-            execute_exit(strat_key, strat_label, name, curr_price, reason)
+            execute_exit(strat_key, strat_label, name, curr_price, "Stop Loss Triggered")
 
     elif pos["side"] == "SELL":
-        # Target 1 (1:2) Hit -> Move SL to Breakeven
+        # TP1 (1:2) Partial Exit
         if (not pos["tp1_hit"]) and len(pos["tp"]) > 0 and (curr_price <= pos["tp"][0]):
             pos["tp1_hit"] = True
             pos["sl"] = min(pos["sl"], pos["entry"])
-            send_telegram(
-                f"🎯 *TARGET 1 (1:2) HIT (SELL)*\n"
-                f"🪙 Asset: {name}\n"
-                f"💵 Price: ${curr_price:.4f}\n"
-                f"🛡️ *SL moved to Breakeven (Entry):* ${pos['entry']:.4f}\n"
-                f"Trade is now Risk-Free! 🚀"
-            )
+            execute_exit(strat_key, strat_label, name, curr_price, "TP1 Hit", partial=True)
 
-        # Final Target 3 (1:5) Hit Exit
-        if len(pos["tp"]) >= 3 and curr_price <= pos["tp"][2]:
-            execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5 Ratio) Achieved! 🏆")
+        # TP3 (1:5) Final Exit
+        elif len(pos["tp"]) >= 3 and curr_price <= pos["tp"][2]:
+            execute_exit(strat_key, strat_label, name, curr_price, "Final TP3 (1:5) Hit! 🏆")
             return
 
-        # Trailing SL update
+        # Trailing SL
         if curr_price < pos["best_price"]:
             pos["best_price"] = curr_price
             new_sl = curr_price + trailing_gap
             if new_sl < pos["sl"]:
                 pos["sl"] = new_sl
-
-        # Stop Loss Triggered
         elif curr_price >= pos["sl"]:
-            reason = "Trailing SL / Stop Loss Triggered"
-            execute_exit(strat_key, strat_label, name, curr_price, reason)
+            execute_exit(strat_key, strat_label, name, curr_price, "Stop Loss Triggered")
 
 def check_strategy_for_symbol(strat_key, cfg, name, ticker_symbol):
     try:
+        check_daily_drawdown_circuit_breaker()
+        if PAPER_ACCOUNT["trading_halted_today"]:
+            return
+
         htf_trend = get_trend(ticker_symbol, cfg["htf_period"], cfg["htf_interval"])
         mtf_trend = get_trend(ticker_symbol, cfg["mtf_period"], cfg["mtf_interval"])
 
@@ -329,6 +366,9 @@ def check_strategy_for_symbol(strat_key, cfg, name, ticker_symbol):
 
         manage_trailing_sl_and_tps(strat_key, cfg["label"], name, curr_price)
 
+        if get_open_positions_count() >= RISK_CONFIG["max_open_trades"]:
+            return
+
         strong_trend = curr_adx > cfg["adx_min"]
         active_pos = active_positions[strat_key][name]["side"]
         tp_mults = cfg["tp_multipliers"]
@@ -339,38 +379,34 @@ def check_strategy_for_symbol(strat_key, cfg, name, ticker_symbol):
             sl = max(swing_l, atr_sl)
             risk_per_unit = curr_price - sl
 
-            if risk_per_unit > 0 and PAPER_ACCOUNT["cash"] >= 200:
-                risk_amount = PAPER_ACCOUNT["cash"] * PAPER_ACCOUNT["risk_per_trade_pct"]
-                units = risk_amount / risk_per_unit
-                total_cost = units * curr_price
+            if risk_per_unit > 0:
+                # Direct 5% Cash Allocation
+                trade_cost = PAPER_ACCOUNT["cash"] * RISK_CONFIG["trade_allocation_pct"]
 
-                if total_cost > PAPER_ACCOUNT["cash"] * 0.2:
-                    total_cost = PAPER_ACCOUNT["cash"] * 0.2
-                    units = total_cost / curr_price
+                if trade_cost > 10 and trade_cost <= PAPER_ACCOUNT["cash"]:
+                    units = trade_cost / curr_price
+                    PAPER_ACCOUNT["cash"] -= trade_cost
+                    tp_targets = [curr_price + (risk_per_unit * m) for m in tp_mults]
 
-                PAPER_ACCOUNT["cash"] -= total_cost
-                tp_targets = [curr_price + (risk_per_unit * m) for m in tp_mults]
+                    active_positions[strat_key][name] = {
+                        "side": "BUY", "entry": curr_price, "sl": sl, "tp": tp_targets,
+                        "best_price": curr_price, "atr": curr_atr, "units": units,
+                        "trade_val": trade_cost, "tp1_hit": False
+                    }
 
-                active_positions[strat_key][name] = {
-                    "side": "BUY", "entry": curr_price, "sl": sl, "tp": tp_targets,
-                    "best_price": curr_price, "atr": curr_atr, "units": units,
-                    "trade_val": total_cost, "tp1_hit": False
-                }
-
-                msg = (
-                    f"🚀 *AUTOMATIC BUY TRIGGERED (PAPER)*\n\n"
-                    f"🏷️ *Strategy:* {cfg['label']}\n"
-                    f"🪙 *Asset:* {name}\n"
-                    f"💵 *Entry:* ${curr_price:.4f}\n"
-                    f"📦 *Position:* ${total_cost:,.2f} ({units:.4f} units)\n"
-                    f"🛑 *SL:* ${sl:.4f} (Risk: ${risk_per_unit:.4f})\n\n"
-                    f"🎯 *TARGETS (R:R Ratio):*\n"
-                    f"• TP 1 (1:2): ${tp_targets[0]:.4f}\n"
-                    f"• TP 2 (1:2): ${tp_targets[1]:.4f}\n"
-                    f"• TP 3 (1:5): ${tp_targets[2]:.4f}\n\n"
-                    f"💼 *Remaining Cash:* ${PAPER_ACCOUNT['cash']:,.2f}"
-                )
-                send_telegram(msg)
+                    send_telegram(
+                        f"🚀 *BUY TRIGGERED (5% ALLOCATION)*\n\n"
+                        f"🏷️ Strategy: {cfg['label']}\n"
+                        f"🪙 Asset: {name}\n"
+                        f"💵 Entry: ${curr_price:.4f}\n"
+                        f"📦 *Position Size (5%):* ${trade_cost:,.2f} ({units:.4f} units)\n"
+                        f"🛑 SL: ${sl:.4f}\n\n"
+                        f"🎯 *TARGETS (R:R):*\n"
+                        f"• TP 1 (1:2): ${tp_targets[0]:.4f} (50% Book + Breakeven SL)\n"
+                        f"• TP 2 (1:2): ${tp_targets[1]:.4f}\n"
+                        f"• TP 3 (1:5): ${tp_targets[2]:.4f} (Full Exit)\n\n"
+                        f"💼 *Remaining Cash:* ${PAPER_ACCOUNT['cash']:,.2f}"
+                    )
 
         # SELL SETUP
         elif (active_pos is None) and (htf_trend == "BEARISH") and strong_trend and (df['ema50'].iloc[-1] < df['ema93'].iloc[-1]) and (curr_price < swing_l) and (curr_price < curr_open):
@@ -378,38 +414,33 @@ def check_strategy_for_symbol(strat_key, cfg, name, ticker_symbol):
             sl = min(swing_h, atr_sl)
             risk_per_unit = sl - curr_price
 
-            if risk_per_unit > 0 and PAPER_ACCOUNT["cash"] >= 200:
-                risk_amount = PAPER_ACCOUNT["cash"] * PAPER_ACCOUNT["risk_per_trade_pct"]
-                units = risk_amount / risk_per_unit
-                total_cost = units * curr_price
+            if risk_per_unit > 0:
+                trade_cost = PAPER_ACCOUNT["cash"] * RISK_CONFIG["trade_allocation_pct"]
 
-                if total_cost > PAPER_ACCOUNT["cash"] * 0.2:
-                    total_cost = PAPER_ACCOUNT["cash"] * 0.2
-                    units = total_cost / curr_price
+                if trade_cost > 10 and trade_cost <= PAPER_ACCOUNT["cash"]:
+                    units = trade_cost / curr_price
+                    PAPER_ACCOUNT["cash"] -= trade_cost
+                    tp_targets = [curr_price - (risk_per_unit * m) for m in tp_mults]
 
-                PAPER_ACCOUNT["cash"] -= total_cost
-                tp_targets = [curr_price - (risk_per_unit * m) for m in tp_mults]
+                    active_positions[strat_key][name] = {
+                        "side": "SELL", "entry": curr_price, "sl": sl, "tp": tp_targets,
+                        "best_price": curr_price, "atr": curr_atr, "units": units,
+                        "trade_val": trade_cost, "tp1_hit": False
+                    }
 
-                active_positions[strat_key][name] = {
-                    "side": "SELL", "entry": curr_price, "sl": sl, "tp": tp_targets,
-                    "best_price": curr_price, "atr": curr_atr, "units": units,
-                    "trade_val": total_cost, "tp1_hit": False
-                }
-
-                msg = (
-                    f"⚠️ *AUTOMATIC SHORT/SELL TRIGGERED (PAPER)*\n\n"
-                    f"🏷️ *Strategy:* {cfg['label']}\n"
-                    f"🪙 *Asset:* {name}\n"
-                    f"💵 *Entry:* ${curr_price:.4f}\n"
-                    f"📦 *Position:* ${total_cost:,.2f} ({units:.4f} units)\n"
-                    f"🛑 *SL:* ${sl:.4f} (Risk: ${risk_per_unit:.4f})\n\n"
-                    f"🎯 *TARGETS (R:R Ratio):*\n"
-                    f"• TP 1 (1:2): ${tp_targets[0]:.4f}\n"
-                    f"• TP 2 (1:2): ${tp_targets[1]:.4f}\n"
-                    f"• TP 3 (1:5): ${tp_targets[2]:.4f}\n\n"
-                    f"💼 *Remaining Cash:* ${PAPER_ACCOUNT['cash']:,.2f}"
-                )
-                send_telegram(msg)
+                    send_telegram(
+                        f"⚠️ *SHORT/SELL TRIGGERED (5% ALLOCATION)*\n\n"
+                        f"🏷️ Strategy: {cfg['label']}\n"
+                        f"🪙 Asset: {name}\n"
+                        f"💵 Entry: ${curr_price:.4f}\n"
+                        f"📦 *Position Size (5%):* ${trade_cost:,.2f} ({units:.4f} units)\n"
+                        f"🛑 SL: ${sl:.4f}\n\n"
+                        f"🎯 *TARGETS (R:R):*\n"
+                        f"• TP 1 (1:2): ${tp_targets[0]:.4f} (50% Book + Breakeven SL)\n"
+                        f"• TP 2 (1:2): ${tp_targets[1]:.4f}\n"
+                        f"• TP 3 (1:5): ${tp_targets[2]:.4f} (Full Exit)\n\n"
+                        f"💼 *Remaining Cash:* ${PAPER_ACCOUNT['cash']:,.2f}"
+                    )
 
     except Exception as e:
         print(f"Error on [{strat_key}] {name}: {e}")
@@ -418,7 +449,7 @@ class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Paper Trading Crypto Engine Live")
+        self.wfile.write(b"5% Allocation Paper Trading Engine Live")
 
 def run_server():
     port = int(os.getenv("PORT", 8080))
@@ -432,11 +463,12 @@ if __name__ == "__main__":
     threading.Thread(target=handle_incoming_users, daemon=True).start()
 
     send_telegram(
-        f"🔥 *Paper Trading Engine Updated!*\n\n"
-        f"• Demo Cash: $10,000 USD\n"
-        f"• R:R Targets: *1:2 | 1:2 | 1:5*\n"
-        f"• Break-even lock on TP1\n"
-        f"• Scanning Top {len(SYMBOLS)} Cryptos 24/7."
+        f"🛡️ *Engine Live: 5% Fixed Allocation Rule*\n\n"
+        f"• Trade Sizing: Exactly 5% of Available Cash per Trade\n"
+        f"• Starting Balance: $10,000 USD\n"
+        f"• R:R Targets: 1:2 (50% Book) -> 1:5 (Runner)\n"
+        f"• Max Open Positions: 5\n"
+        f"• Scanning Top {len(SYMBOLS)} Cryptos."
     )
 
     last_list_refresh = time.time()
